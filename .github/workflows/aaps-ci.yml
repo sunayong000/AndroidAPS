@@ -9,6 +9,7 @@ on:
         default: '3.4.2.3'
         type: choice
         options:
+          - 3.4.2.3-custom
           - 3.4.2.3
           - 3.4.2.2
           - 3.4.2.1
