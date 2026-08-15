@@ -157,22 +157,17 @@ jobs:
 
       - name: Decode GDrive OAuth2 secrets
         run: |
-          echo "🔐 Decoding GDRIVE_OAUTH2..."
-          DECODED=$(echo "${{ secrets.GDRIVE_OAUTH2 }}" | base64 -d)
-
-          GDRIVE_CLIENT_ID=$(echo "$DECODED" | cut -d'|' -f1)
-          GDRIVE_REFRESH_TOKEN=$(echo "$DECODED" | cut -d'|' -f2)
-
-          echo "::add-mask::$GDRIVE_CLIENT_ID"
-          echo "::add-mask::$GDRIVE_REFRESH_TOKEN"
-
-          echo "GDRIVE_CLIENT_ID=$GDRIVE_CLIENT_ID" >> $GITHUB_ENV
-          echo "GDRIVE_REFRESH_TOKEN=$GDRIVE_REFRESH_TOKEN" >> $GITHUB_ENV
-
-          echo "✅ GDRIVE_CLIENT_ID and GDRIVE_REFRESH_TOKEN extracted from GDRIVE_OAUTH2"
+          echo "🔐 GDrive upload disabled — using GitHub Artifacts instead"
+          echo "GDRIVE_CLIENT_ID=skip" >> $GITHUB_ENV
+          echo "GDRIVE_REFRESH_TOKEN=skip" >> $GITHUB_ENV
 
       - name: Retrieving Google Drive access token
         run: |
+          if [ "$GDRIVE_CLIENT_ID" = "skip" ]; then
+            echo "✅ Skipping GDrive token (artifact mode)"
+            echo "ACCESS_TOKEN=skip" >> $GITHUB_ENV
+            exit 0
+          fi
           echo "🔐 Getting Google OAuth2 access token..."
           TOKEN_RESPONSE=$(curl -s -X POST https://oauth2.googleapis.com/token \
             -d client_id="$GDRIVE_CLIENT_ID" \
@@ -272,90 +267,15 @@ jobs:
           mv app/build/outputs/apk/${{ env.VARIANT_FLAVOR }}/${{ env.VARIANT_TYPE }}/*.apk aaps-${{ env.VERSION }}${{ env.VERSION_SUFFIX }}.apk
           mv wear/build/outputs/apk/${{ env.VARIANT_FLAVOR }}/${{ env.VARIANT_TYPE }}/*.apk aaps-wear-${{ env.VERSION }}${{ env.VERSION_SUFFIX }}.apk
 
-      - name: Upload APKs to Google Drive
-        run: |
-          set -e
-          echo "🔐 Start uploading APKs to Google Drive..."
-
-          echo "📁 Checking or creating AAPS folder"
-          AAPS_FOLDER_ID=$(curl -s -X GET \
-            -H "Authorization: Bearer $ACCESS_TOKEN" \
-            "https://www.googleapis.com/drive/v3/files?q=name='AAPS'+and+mimeType='application/vnd.google-apps.folder'+and+trashed=false" \
-            | jq -r '.files[0].id')
-
-          if [ "$AAPS_FOLDER_ID" == "null" ] || [ -z "$AAPS_FOLDER_ID" ]; then
-            AAPS_FOLDER_ID=$(curl -s -X POST \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d '{"name": "AAPS", "mimeType": "application/vnd.google-apps.folder"}' \
-              "https://www.googleapis.com/drive/v3/files" | jq -r '.id')
-            echo "📂 Created AAPS folder: $AAPS_FOLDER_ID"
-          else
-            echo "📂 Found AAPS folder: $AAPS_FOLDER_ID"
-          fi
-
-          echo "📁 Checking or creating version folder: $VERSION"
-          VERSION_FOLDER_ID=$(curl -s -X GET \
-            -H "Authorization: Bearer $ACCESS_TOKEN" \
-            "https://www.googleapis.com/drive/v3/files?q=name='${VERSION}'+and+mimeType='application/vnd.google-apps.folder'+and+'$AAPS_FOLDER_ID'+in+parents+and+trashed=false" \
-            | jq -r '.files[0].id')
-
-          if [ "$VERSION_FOLDER_ID" == "null" ] || [ -z "$VERSION_FOLDER_ID" ]; then
-            VERSION_FOLDER_ID=$(curl -s -X POST \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{\"name\": \"${VERSION}\", \"mimeType\": \"application/vnd.google-apps.folder\", \"parents\": [\"$AAPS_FOLDER_ID\"]}" \
-              "https://www.googleapis.com/drive/v3/files" | jq -r '.id')
-            echo "📂 Created version folder: $VERSION_FOLDER_ID"
-          else
-            echo "📂 Found version folder: $VERSION_FOLDER_ID"
-          fi
-
-          upload_to_gdrive() {
-            FILE=$1
-            NAME=$2
-            if [ ! -f "$FILE" ]; then
-              echo "❌ File not found: $FILE"
-              exit 26
-            fi
-
-            echo "📄 Checking if file $NAME already exists in Google Drive..."
-            QUERY="name='${NAME}' and '${VERSION_FOLDER_ID}' in parents and trashed=false"
-            ENCODED_QUERY=$(python3 -c "import urllib.parse; print(urllib.parse.quote('''$QUERY'''))")
-            FILE_ID=$(curl -s \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              "https://www.googleapis.com/drive/v3/files?q=${ENCODED_QUERY}&fields=files(id)" \
-              | jq -r '.files[0].id')
-
-            if [[ -n "$FILE_ID" && "$FILE_ID" != "null" ]]; then
-              echo "🗑️ Deleting existing file with ID: $FILE_ID"
-              curl -s -X DELETE \
-                -H "Authorization: Bearer $ACCESS_TOKEN" \
-                "https://www.googleapis.com/drive/v3/files/${FILE_ID}"
-            fi
-
-            echo "⬆️ Uploading $FILE as $NAME to Google Drive..."
-            RESPONSE=$(curl -s -w "%{http_code}" -o /tmp/gdrive_response.json \
-              -X POST \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -F "metadata={\"name\":\"$NAME\", \"parents\":[\"$VERSION_FOLDER_ID\"]};type=application/json;charset=UTF-8" \
-              -F "file=@$FILE;type=application/vnd.android.package-archive" \
-              "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart")
-
-            HTTP_CODE="${RESPONSE: -3}"
-            if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "201" ]]; then
-              echo "❌ Upload failed with HTTP status: $HTTP_CODE"
-              cat /tmp/gdrive_response.json
-              exit 1
-            fi
-
-            echo "✅ Uploaded: $NAME"
-          }
-
-          upload_to_gdrive "aaps-${VERSION}${VERSION_SUFFIX}.apk" "aaps-${VERSION}${VERSION_SUFFIX}.apk"
-          upload_to_gdrive "aaps-wear-${VERSION}${VERSION_SUFFIX}.apk" "aaps-wear-${VERSION}${VERSION_SUFFIX}.apk"
-
-          echo "🎉 APKs successfully uploaded to Google Drive!"
+      - name: Upload APKs as GitHub Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: aaps-${{ env.VERSION }}${{ env.VERSION_SUFFIX }}
+          path: |
+            aaps-${{ env.VERSION }}${{ env.VERSION_SUFFIX }}.apk
+            aaps-wear-${{ env.VERSION }}${{ env.VERSION_SUFFIX }}.apk
+          if-no-files-found: error
+          retention-days: 14
 
   # Configuration: Threshold-based cleanup
   # Clean up only occurs when total runs exceed: keep_runs + keep_threshold (e.g., 20 + 5 = 25)
