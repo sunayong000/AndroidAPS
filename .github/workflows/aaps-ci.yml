@@ -214,6 +214,11 @@ jobs:
           git checkout refs/tags/${{ github.event.inputs.tagName }}
           echo "✅ Checked out tag ${{ github.event.inputs.tagName }}"
 
+      - name: Apply Equil BLE hardening (from fork master)
+        run: |
+          git checkout master -- pump/equil/src/main/kotlin/app/aaps/pump/equil/ble/EquilBLE.kt
+          echo "✅ Equil BLE hardening applied (branch equil-ble-fix / Phase 2)"
+
       - name: Set BUILD_VARIANT
         run: |
           BUILD_VARIANT="${{ github.event.inputs.buildVariant }}"
