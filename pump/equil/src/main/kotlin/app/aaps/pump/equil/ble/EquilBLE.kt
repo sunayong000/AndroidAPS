@@ -118,6 +118,7 @@ class EquilBLE @Inject constructor(
                 }
                 if (i2 == BluetoothProfile.STATE_CONNECTED) {
                     isConnected = true
+                    descriptorWriteRetried = false
                     equilManager.equilState?.bluetoothConnectionState = BluetoothConnectionState.CONNECTED
                     handler.removeMessages(TIME_OUT_CONNECT_WHAT)
                     // Link is up: stop the parallel advert-harvest scan (the pump stops advertising once
@@ -140,7 +141,10 @@ class EquilBLE @Inject constructor(
             @Synchronized
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
                 if (status != BluetoothGatt.GATT_SUCCESS) {
-                    aapsLogger.debug(LTag.PUMPBTCOMM, "onServicesDiscovered received: $status")
+                    // Services discovery failed: we cannot reach the pump's UART characteristics.
+                    // Fail fast instead of letting the command idle until its 22 s timeout.
+                    aapsLogger.error(LTag.PUMPBTCOMM, "onServicesDiscovered FAILED status=$status")
+                    handleFatalLinkFailure("services discovery failed status=$status")
                     return
                 }
                 val service = gatt.getService(UUID.fromString(GattAttributes.SERVICE_RADIO))
@@ -154,6 +158,14 @@ class EquilBLE @Inject constructor(
             }
 
             override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    // Write failed: the pump never received this packet. Sending the remaining packets would
+                    // leave the command half-sent and the pump waiting forever -> 22 s idle timeout -> "Set bolus none".
+                    // Fail fast: wake the waiting command and tear down the link so the NEXT command starts clean.
+                    aapsLogger.error(LTag.PUMPBTCOMM, "onCharacteristicWrite FAILED status=$status")
+                    handleFatalLinkFailure("characteristic write failed status=$status")
+                    return
+                }
                 try {
                     SystemClock.sleep(EquilConst.EQUIL_BLE_WRITE_TIME_OUT)
                     writeData()
@@ -186,6 +198,18 @@ class EquilBLE @Inject constructor(
                         // link was down). Send-once via dispatchedCmd so it can't collide/double with writeCmd.
                         dispatchCmd()
                     }
+                } else {
+                    // Descriptor write failed: notifications never enabled, so the pump's replies would never
+                    // arrive and any queued command would idle-timeout into "Set bolus none". Retry once, then
+                    // fail fast and let the next command reconnect from a clean state.
+                    aapsLogger.error(LTag.PUMPBTCOMM, "onDescriptorWrite FAILED status=$status")
+                    if (!descriptorWriteRetried) {
+                        descriptorWriteRetried = true
+                        aapsLogger.debug(LTag.PUMPBTCOMM, "onDescriptorWrite retrying openNotification()")
+                        try { openNotification() } catch (e: Exception) { aapsLogger.error(LTag.PUMPBTCOMM, "retry openNotification error", e) }
+                    } else {
+                        handleFatalLinkFailure("descriptor write failed twice status=$status")
+                    }
                 }
             }
         }
@@ -215,6 +239,7 @@ class EquilBLE @Inject constructor(
         baseCmd?.let { baseCmd ->
             equilResponse = baseCmd.getEquilResponse()
             indexData = 0
+            armCmdWatchdog()
             writeData()
         }
     }
@@ -248,6 +273,8 @@ class EquilBLE @Inject constructor(
         bluetoothGatt = null
         baseCmd = null
         preCmd = null
+        descriptorWriteRetried = false
+        disarmCmdWatchdog()
         synchronized(notifyLock) {
             notificationEnabled = false
             dispatchedCmd = null
@@ -288,6 +315,45 @@ class EquilBLE @Inject constructor(
 
     private var baseCmd: BaseCmd? = null
     private var preCmd: BaseCmd? = null
+
+    // --- Phase-2 hardening (custom fork build) ---
+    // Descriptor-write retry guard: reset on (re)connect, set after the first failed descriptor write.
+    private var descriptorWriteRetried = false
+
+    // Command watchdog: a command that has started sending must get a pump response within
+    // CMD_WATCHDOG_TIMEOUT. If the pump goes silent mid-command (stale link, missed packet),
+    // fail fast and drop the link so the NEXT command reconnects clean instead of stacking
+    // failures ("Set bolus none" xN). Re-armed on every received packet; disarmed on disconnect.
+    private var cmdWatchdog: Runnable? = null
+
+    private fun armCmdWatchdog() {
+        handler.removeCallbacks(cmdWatchdog)
+        val r = Runnable {
+            val cmd = baseCmd
+            aapsLogger.error(LTag.PUMPCOMM, "CMD WATCHDOG: no pump response in ${CMD_WATCHDOG_TIMEOUT}ms, cmd=${cmd?.javaClass?.simpleName}, cmdSuccess=${cmd?.cmdSuccess}")
+            if (cmd != null && !cmd.cmdSuccess) {
+                cmd.resolvedResult = ResolvedResult.CONNECT_ERROR
+                bleConnectErrorForResult()
+                disconnect()
+            }
+        }
+        cmdWatchdog = r
+        handler.postDelayed(r, CMD_WATCHDOG_TIMEOUT)
+    }
+
+    private fun disarmCmdWatchdog() {
+        handler.removeCallbacks(cmdWatchdog)
+        cmdWatchdog = null
+    }
+
+    // Unified fast-fail path for unrecoverable link errors: wake the waiting command with a
+    // connection error and tear down the stale link so the command queue reconnects cleanly.
+    private fun handleFatalLinkFailure(reason: String) {
+        aapsLogger.error(LTag.PUMPCOMM, "FATAL LINK FAILURE: $reason")
+        baseCmd?.resolvedResult = ResolvedResult.CONNECT_ERROR
+        bleConnectErrorForResult()
+        disconnect()
+    }
 
     // Notification-readiness gate for the current GATT connection. Android allows only ONE outstanding
     // GATT operation at a time. When the queue's connect() phase opens the link, `isConnected` flips
@@ -392,7 +458,12 @@ class EquilBLE @Inject constructor(
         }
         writeChara?.setValue(bytes)
         aapsLogger.debug(LTag.PUMPBTCOMM, "write: ${Utils.bytesToHex(bytes)}")
-        bluetoothGatt?.writeCharacteristic(writeChara)
+        val writeOk = bluetoothGatt?.writeCharacteristic(writeChara)
+        if (writeOk == false) {
+            // Android rejected the write (GATT queue busy / link dropped). Log it for diagnosis; the
+            // command watchdog or a subsequent onCharacteristicWrite will resolve the state.
+            aapsLogger.error(LTag.PUMPBTCOMM, "writeCharacteristic rejected (ok=false), link may be down")
+        }
     }
 
     private var dataList: List<String> = ArrayList()
@@ -403,6 +474,9 @@ class EquilBLE @Inject constructor(
         aapsLogger.debug(LTag.PUMPBTCOMM, "decode=====$str")
         val response = baseCmd?.decodeEquilPacket(buffer)
         if (response != null) {
+            // Pump answered: the link is alive. Keep the watchdog armed so a command that goes
+            // half-answered (multi-packet) still gets killed if the pump stops replying.
+            armCmdWatchdog()
             writeConf(response)
             dataList = ArrayList()
         }
@@ -556,5 +630,9 @@ class EquilBLE @Inject constructor(
 
         const val TIME_OUT_WHAT = 0x12
         const val TIME_OUT_CONNECT_WHAT = 0x13
+
+        // Command watchdog: 15 s of pump silence after the first packet was sent = stale link.
+        // (EquilManager's command wait is 22 s; we fail 7 s earlier and, crucially, drop the link.)
+        const val CMD_WATCHDOG_TIMEOUT = 15000L
     }
 }
