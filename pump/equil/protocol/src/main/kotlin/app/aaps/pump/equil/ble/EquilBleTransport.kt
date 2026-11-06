@@ -26,4 +26,11 @@ interface EquilBleTransport : BleTransport {
      * then, so a waiting command must fail at once instead of waiting for its timeout.
      */
     var onDescriptorWriteFailed: (() -> Unit)?
+
+    /**
+     * Called when a characteristic write fails (GATT status != SUCCESS, or writeCharacteristic()
+     * returned false). The packet never reached the pump, so the command must fail fast instead of
+     * waiting for its timeout — otherwise the remaining packets would be sent into a dead link.
+     */
+    var onCharacteristicWriteFailed: (() -> Unit)?
 }
