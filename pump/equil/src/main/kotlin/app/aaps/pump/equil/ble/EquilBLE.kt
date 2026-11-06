@@ -87,7 +87,7 @@ class EquilBLE(
      * command reconnects clean, instead of stacking failures ("Set bolus none" xN).
      */
     private fun armCmdWatchdog() {
-        handler.removeCallbacks(cmdWatchdogRunnable)
+        cmdWatchdogRunnable?.let { handler.removeCallbacks(it) }
         val r = Runnable {
             val cmd = baseCmd
             aapsLogger.error(
@@ -105,7 +105,7 @@ class EquilBLE(
     }
 
     private fun disarmCmdWatchdog() {
-        handler.removeCallbacks(cmdWatchdogRunnable)
+        cmdWatchdogRunnable?.let { handler.removeCallbacks(it) }
     }
 
     /**
