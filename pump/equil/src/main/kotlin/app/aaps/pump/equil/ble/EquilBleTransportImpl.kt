@@ -55,6 +55,7 @@ class EquilBleTransportImpl(
     override var scanAddress: String? = null
     override var onGattError133: (() -> Unit)? = null
     override var onDescriptorWriteFailed: (() -> Unit)? = null
+    override var onCharacteristicWriteFailed: (() -> Unit)? = null
 
     @Suppress("deprecation", "OVERRIDE_DEPRECATION")
     private val gattCallback = object : BluetoothGattCallback() {
@@ -88,7 +89,14 @@ class EquilBleTransportImpl(
         }
 
         override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-            listener?.onCharacteristicWritten()
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                listener?.onCharacteristicWritten()
+            } else {
+                // Packet never reached the pump: fail fast instead of sending the remaining packets
+                // into a dead link and waiting for the command timeout.
+                aapsLogger.error(LTag.PUMPBTCOMM, "onCharacteristicWrite FAILED status=$status")
+                onCharacteristicWriteFailed?.invoke()
+            }
         }
 
         override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
@@ -291,7 +299,10 @@ class EquilBleTransportImpl(
                 return
             }
             chara.setValue(data)
-            gatt.writeCharacteristic(chara)
+            if (!gatt.writeCharacteristic(chara)) {
+                aapsLogger.error(LTag.PUMPBTCOMM, "writeCharacteristic rejected (ok=false), link may be down")
+                onCharacteristicWriteFailed?.invoke()
+            }
         }
 
         override fun requestConnectionPriority(priority: Int) {
