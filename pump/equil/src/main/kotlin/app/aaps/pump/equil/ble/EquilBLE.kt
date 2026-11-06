@@ -45,6 +45,10 @@ class EquilBLE(
     var connecting = false
     private var connectInitiated = false
     private var connectRunnable: Runnable? = null
+    // Hardening: descriptor-write retry guard (reset on every (re)connect)
+    private var descriptorWriteRetried = false
+    // Hardening: command watchdog - a started command must be answered within this window
+    private var cmdWatchdogRunnable: Runnable? = null
     var macAddress: String? = null
     private var bleHandler = Handler(HandlerThread(this::class.simpleName + "Handler").also { it.start() }.looper)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -59,7 +63,49 @@ class EquilBLE(
             aapsLogger.debug(LTag.PUMPCOMM, "error133 ")
             baseCmd?.resolvedResult = ResolvedResult.CONNECT_ERROR
         }
-        bleTransport.onDescriptorWriteFailed = { linkSetupFailed("enabling notifications failed") }
+        bleTransport.onDescriptorWriteFailed = { onNotifySetupFailed("enabling notifications failed") }
+        bleTransport.onCharacteristicWriteFailed = { linkSetupFailed("characteristic write failed") }
+    }
+
+    /**
+     * Notifications could not be enabled on the first attempt (transient GATT hiccup). Retry the
+     * descriptor write once; a second failure means the link is unusable, so fail the command fast.
+     */
+    private fun onNotifySetupFailed(reason: String) {
+        if (!descriptorWriteRetried) {
+            descriptorWriteRetried = true
+            aapsLogger.debug(LTag.PUMPBTCOMM, "$reason - retrying enableNotifications once")
+            bleTransport.gatt.enableNotifications()
+        } else {
+            linkSetupFailed("$reason (twice)")
+        }
+    }
+
+    /**
+     * A command that has started sending must get a pump response within CMD_WATCHDOG_TIMEOUT.
+     * If the pump goes silent mid-command, fail the waiting command and drop the link so the next
+     * command reconnects clean, instead of stacking failures ("Set bolus none" xN).
+     */
+    private fun armCmdWatchdog() {
+        handler.removeCallbacks(cmdWatchdogRunnable)
+        val r = Runnable {
+            val cmd = baseCmd
+            aapsLogger.error(
+                LTag.PUMPCOMM,
+                "CMD WATCHDOG: no pump response in ${CMD_WATCHDOG_TIMEOUT}ms, cmd=${cmd?.javaClass?.simpleName}, success=${cmd?.cmdSuccess}"
+            )
+            if (cmd != null && !cmd.cmdSuccess) {
+                cmd.resolvedResult = ResolvedResult.CONNECT_ERROR
+                bleConnectErrorForResult()
+                disconnect()
+            }
+        }
+        cmdWatchdogRunnable = r
+        handler.postDelayed(r, CMD_WATCHDOG_TIMEOUT)
+    }
+
+    private fun disarmCmdWatchdog() {
+        handler.removeCallbacks(cmdWatchdogRunnable)
     }
 
     /**
@@ -81,6 +127,8 @@ class EquilBLE(
         connecting = false
         if (connected) {
             isConnected = true
+            descriptorWriteRetried = false
+            disarmCmdWatchdog()
             equilManager?.equilState?.bluetoothConnectionState = BluetoothConnectionState.CONNECTED
             handler.removeMessages(TIME_OUT_CONNECT_WHAT)
             // Link up: stop the parallel advert-harvest scan (the pump stops advertising once connected; if it
@@ -152,6 +200,7 @@ class EquilBLE(
             equilResponse = baseCmd.getEquilResponse()
             indexData = 0
             writeData()
+            armCmdWatchdog()
         }
     }
 
@@ -185,6 +234,8 @@ class EquilBLE(
         bleTransport.gatt.close()
         baseCmd = null
         preCmd = null
+        descriptorWriteRetried = false
+        disarmCmdWatchdog()
         synchronized(notifyLock) {
             notificationEnabled = false
             dispatchedCmd = null
@@ -334,6 +385,9 @@ class EquilBLE(
         aapsLogger.debug(LTag.PUMPBTCOMM, "decode=====$str")
         val response = baseCmd?.decodeEquilPacket(buffer)
         if (response != null) {
+            // Pump answered: the link is alive. Re-arm so a half-answered multi-packet command is
+            // still killed if the pump stops replying.
+            armCmdWatchdog()
             writeConf(response)
             dataList = ArrayList()
         }
@@ -429,6 +483,8 @@ class EquilBLE(
         if (transmitterMAC == null) return
         bleTransport.adapter.removeBond(transmitterMAC)
     }
+
+    private val CMD_WATCHDOG_TIMEOUT = 30_000L
 
     var handler: Handler = object : Handler(HandlerThread(this::class.simpleName + "MessageHandler").also { it.start() }.looper) {
         override fun handleMessage(msg: Message) {
